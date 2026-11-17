@@ -1,0 +1,20 @@
+{
+  "name": "convbridge",
+  "version": "0.1.0",
+  "description": "Search opencode and Claude Code conversations from either tool via a local MCP server.",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "bin": {
+    "convbridge": "src/cli.ts"
+  },
+  "scripts": {
+    "serve": "bun run src/server.ts",
+    "reindex": "bun run src/cli.ts reindex",
+    "test": "bun test"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  },
+  "keywords": ["mcp", "opencode", "claude-code", "search", "sqlite", "fts5"]
+}
