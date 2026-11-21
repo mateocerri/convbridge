@@ -189,4 +189,62 @@ describe("redact", () => {
     expect(redact("api_key=hunter2")).toBe("api_key=[REDACTED]");
     expect(redact("task-manager is fine")).toBe("task-manager is fine");
   });
+
+  test("masks JSON-style, token-prefixed, PEM and URL-embedded secrets", () => {
+    expect(redact('{"password": "hunter2", "user": "me"}')).toBe('{"password": [REDACTED], "user": "me"}');
+    expect(redact("export TOKEN='abc def'")).toBe("export TOKEN=[REDACTED]");
+    expect(redact("gh auth: ghp_abcdefghijklmnopqrstuvwxyz0123456789")).toBe("gh auth: [REDACTED_KEY]");
+    expect(redact("id AKIAABCDEFGHIJKLMNOP here")).toBe("id [REDACTED_KEY] here");
+    expect(redact("-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----")).toBe(
+      "[REDACTED_PRIVATE_KEY]",
+    );
+    expect(redact("git clone https://me:s3cret@github.com/x/y.git")).toBe(
+      "git clone https://[REDACTED]@github.com/x/y.git",
+    );
+    expect(redact("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3.SflKxwRJSMeKKF2QT4fw")).toBe("[REDACTED_JWT]");
+  });
+});
+
+describe("search relaxation", () => {
+  test("a sentence whose words never share one turn still finds the best partial matches", async () => {
+    const idx = newIndex();
+    await idx.sync(true);
+    // "renderizacion" is in turn 1 and "blit" in turn 2; no single turn has both
+    const out = idx.search("renderizacion blit");
+    expect(out).toContain("partial matches");
+    expect(out).toContain("opencode:ses_1#1");
+    expect(out).toContain("opencode:ses_1#2");
+    idx.close();
+  });
+
+  test("when every term matches, no relaxation note is shown", async () => {
+    const idx = newIndex();
+    await idx.sync(true);
+    expect(idx.search("usar drs")).not.toContain("partial matches");
+    idx.close();
+  });
+});
+
+describe("claude sync does not fake activity", () => {
+  test("appending only non-turn lines leaves the session's updated time alone", async () => {
+    const sid = "22222222-aaaa-bbbb-cccc-000000000002";
+    const file = join(projDir, `${sid}.jsonl`);
+    writeFileSync(
+      file,
+      claudeLine({
+        type: "user", sessionId: sid, cwd: "C:\\work", timestamp: "2026-11-01T10:00:00Z",
+        message: { role: "user", content: "hola mundo" },
+      }),
+    );
+    const idx = newIndex();
+    await idx.sync(true);
+    const before = (idx.db.query("select updated from sessions where id = ?").get(sid) as any).updated;
+    expect(before).toBe(Date.parse("2026-11-01T10:00:00Z"));
+
+    appendFileSync(file, claudeLine({ type: "file-history-snapshot", sessionId: sid }));
+    await idx.sync(true);
+    const after = (idx.db.query("select updated from sessions where id = ?").get(sid) as any).updated;
+    expect(after).toBe(before);
+    idx.close();
+  });
 });

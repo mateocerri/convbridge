@@ -164,10 +164,16 @@ export class Index {
 
       const id = sessionId ?? chunk.sessionId ?? fallbackId;
       const lastSeq = chunk.turns.at(-1)?.seq ?? knownLast;
-      const stamp = Math.max(...chunk.turns.map((t) => t.ts ?? 0), 0) || Date.now();
       const existing = this.db
-        .query("select title, cwd, started from sessions where source = 'claude' and id = ?")
-        .get(id) as { title: string | null; cwd: string | null; started: number | null } | null;
+        .query("select title, cwd, started, updated from sessions where source = 'claude' and id = ?")
+        .get(id) as
+        | { title: string | null; cwd: string | null; started: number | null; updated: number | null }
+        | null;
+      // reduce, not Math.max(...spread): a long session has enough turns to
+      // overflow the argument limit. A chunk with no turns (snapshots, titles)
+      // must not bump `updated` to now, or it jumps to the top of `recent`.
+      const turnStamp = chunk.turns.reduce((m, t) => Math.max(m, t.ts ?? 0), 0);
+      const stamp = turnStamp || existing?.updated || Date.now();
 
       this.upsertSession("claude", id, {
         title: chunk.title ?? existing?.title ?? null,
@@ -241,9 +247,9 @@ export class Index {
     const terms = query.match(/[\p{L}\p{N}]+/gu) ?? [];
     if (terms.length === 0) return "No searchable terms in query.";
 
-    const match = terms.map((t) => `"${t}"*`).join(" AND ");
+    const matchOf = (joiner: string) => terms.map((t) => `"${t}"*`).join(joiner);
     const where: string[] = ["turns_fts match ?"];
-    const args: (string | number)[] = [match];
+    const args: (string | number)[] = [matchOf(" AND ")];
     if (opts.source && opts.source !== "any") {
       where.push("t.source = ?");
       args.push(opts.source);
@@ -262,25 +268,34 @@ export class Index {
     args.push(limit);
 
     let rows: any[];
+    let relaxed = false;
     try {
-      rows = this.db
-        .query(
-          `select t.source, t.session_id, t.seq, t.role, t.ts, s.title, s.cwd,
-                  snippet(turns_fts, 0, '[', ']', '…', 24) as snip
-           from turns_fts
-           join turns t on t.rowid = turns_fts.rowid
-           join sessions s on s.source = t.source and s.id = t.session_id
-           where ${where.join(" and ")}
-           order by bm25(turns_fts)
-           limit ?`,
-        )
-        .all(...args);
+      const stmt = this.db.query(
+        `select t.source, t.session_id, t.seq, t.role, t.ts, s.title, s.cwd,
+                snippet(turns_fts, 0, '[', ']', '…', 24) as snip
+         from turns_fts
+         join turns t on t.rowid = turns_fts.rowid
+         join sessions s on s.source = t.source and s.id = t.session_id
+         where ${where.join(" and ")}
+         order by bm25(turns_fts)
+         limit ?`,
+      );
+      rows = stmt.all(...args);
+      // Agents tend to send whole sentences, and requiring every word to
+      // appear in one turn finds nothing. Retry with any-word matching;
+      // bm25 still ranks turns containing more of the terms first.
+      if (rows.length === 0 && terms.length > 1) {
+        args[0] = matchOf(" OR ");
+        rows = stmt.all(...args);
+        relaxed = rows.length > 0;
+      }
     } catch (e) {
       return `Search error: ${(e as Error).message}`;
     }
     if (rows.length === 0) return `No matches for "${query}".`;
 
     const out: string[] = [];
+    if (relaxed) out.push("(no turn contains every term; showing partial matches)");
     let used = 0;
     let shown = 0;
     for (const r of rows) {
