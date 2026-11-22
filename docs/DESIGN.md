@@ -22,7 +22,7 @@ This document describes the architecture, data model, tool contracts and verific
 
 ### 2.1 opencode
 
-Location: `~/.local/share/opencode/opencode.db` (SQLite, WAL mode). Opened with `readonly` access.
+Locations: the Windows database and one per WSL distro home (see README, Sources). Opened with `readonly` access; databases on WSL are copied to a snapshot first, because they cannot be opened in place from Windows while opencode runs.
 
 Relevant tables:
 
@@ -105,7 +105,7 @@ Notes:
 
 ### 3.1 Incremental indexing
 
-- **opencode:** a session is re-read when `session_v2.time_updated` is newer than the stored `updated`. Only messages with `seq` greater than the stored maximum are inserted.
+- **opencode:** a session is re-read when `session.time_updated` is newer than the stored `updated`. Only messages with a position (`seq`, the 1-based order of the message in its session) greater than the stored maximum are inserted.
 - **Claude Code:** each JSONL file is tracked by the byte offset of the last fully parsed line (`files` table). Only appended bytes are read. A partial last line (no trailing newline) is left for the next pass. If a file becomes smaller than its stored offset, the session is deleted from the index and reparsed from zero.
 - A sync pass that adds no turns does not change a session's `updated`, so snapshot-only writes do not reorder `recent`.
 - **Freshness:** the server reindexes on startup and before a search if the last reindex is older than 30 seconds.

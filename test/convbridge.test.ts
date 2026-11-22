@@ -12,34 +12,32 @@ let opencodeDb: string;
 let claudeDir: string;
 let projDir: string;
 
+// Mirrors the current opencode layout: session, message (role in JSON), part (one row per block).
 function makeOpencodeDb(path: string) {
   const db = new Database(path);
   db.exec(`
-    create table session_v2 (id text primary key, directory text, title text,
-      time_created integer, time_updated integer);
-    create table session_message (id text primary key, session_id text, type text,
-      seq integer, time_created integer, data text);
-    create table session_part (message_id text, ordinal integer);
+    create table session (id text primary key, project_id text, directory text not null,
+      title text not null, time_created integer not null, time_updated integer not null);
+    create table message (id text primary key, session_id text not null,
+      time_created integer not null, time_updated integer not null, data text not null);
+    create table part (id text primary key, message_id text not null, session_id text not null,
+      time_created integer not null, time_updated integer not null, data text not null);
   `);
-  db.run("insert into session_v2 values ('ses_1', '/work/morph', 'Lanzamiento Morph', 1000, 2000)");
-  const ins = db.query("insert into session_message values (?, ?, ?, ?, ?, ?)");
-  ins.run("m1", "ses_1", "user", 1, 1000, JSON.stringify({ text: "Revisemos la renderización a 1080p" }));
-  ins.run(
-    "m2",
-    "ses_1",
-    "assistant",
-    2,
-    1100,
-    JSON.stringify({
-      content: [
-        { type: "reasoning", text: "PRIVATE CHAIN OF THOUGHT" },
-        { type: "text", text: "Usar DRS con blit fullscreen." },
-        { type: "tool", name: "execute" },
-      ],
-    }),
-  );
-  ins.run("m3", "ses_1", "compaction", 3, 1200, JSON.stringify({ text: "auto summary" }));
-  ins.run("m4", "ses_1", "system", 4, 1300, JSON.stringify({ text: "Today's date is now" }));
+  db.run("insert into session values ('ses_1', 'p1', '/work/morph', 'Lanzamiento Morph', 1000, 2000)");
+  const msg = db.query("insert into message values (?, ?, ?, ?, ?)");
+  const part = db.query("insert into part values (?, ?, ?, ?, ?, ?)");
+  msg.run("m1", "ses_1", 1000, 1000, JSON.stringify({ role: "user", time: { created: 1000 } }));
+  part.run("p1", "m1", "ses_1", 1000, 1000, JSON.stringify({ type: "text", text: "Revisemos la renderización a 1080p" }));
+  part.run("p1b", "m1", "ses_1", 1001, 1001, JSON.stringify({ type: "text", text: "<system-reminder>injected</system-reminder>", synthetic: true }));
+
+  msg.run("m2", "ses_1", 1100, 1100, JSON.stringify({ role: "assistant", time: { created: 1100 } }));
+  part.run("p2", "m2", "ses_1", 1100, 1100, JSON.stringify({ type: "step-start", snapshot: "abc" }));
+  part.run("p3", "m2", "ses_1", 1101, 1101, JSON.stringify({ type: "reasoning", text: "PRIVATE CHAIN OF THOUGHT" }));
+  part.run("p4", "m2", "ses_1", 1102, 1102, JSON.stringify({ type: "text", text: "Usar DRS con blit fullscreen." }));
+  part.run("p5", "m2", "ses_1", 1103, 1103, JSON.stringify({ type: "tool", tool: "execute", callID: "c1", state: {} }));
+
+  msg.run("m3", "ses_1", 1200, 1200, JSON.stringify({ role: "system", time: { created: 1200 } }));
+  part.run("p6", "m3", "ses_1", 1200, 1200, JSON.stringify({ type: "text", text: "Today's date is now" }));
   db.close();
 }
 
@@ -61,7 +59,7 @@ afterEach(() => {
 });
 
 function newIndex(): Index {
-  return new Index({ indexDir: join(root, "idx"), opencodeDb, claudeDir });
+  return new Index({ indexDir: join(root, "idx"), opencodeDbs: [opencodeDb], claudeDirs: [claudeDir] });
 }
 
 describe("opencode source", () => {
@@ -81,11 +79,28 @@ describe("opencode source", () => {
   test("schema mismatch disables the source without throwing", async () => {
     const bad = join(root, "bad.db");
     const db = new Database(bad);
-    db.exec("create table session_v2 (id text);");
+    db.exec("create table session (id text); create table message (id text); create table part (id text);");
     db.close();
-    const idx = new Index({ indexDir: join(root, "idx2"), opencodeDb: bad, claudeDir });
+    const idx = new Index({ indexDir: join(root, "idx2"), opencodeDbs: [bad], claudeDirs: [claudeDir] });
     const r = await idx.sync(true);
     expect(r.errors[0]).toContain("SCHEMA_MISMATCH");
+    idx.close();
+  });
+
+  test("incremental sync picks up only messages added after the last sync", async () => {
+    const idx = newIndex();
+    await idx.sync(true);
+
+    const db = new Database(opencodeDb);
+    db.run("insert into message values ('m9', 'ses_1', 5000, 5000, '{\"role\":\"user\"}')");
+    db.run("insert into part values ('p9', 'm9', 'ses_1', 5000, 5000, '{\"type\":\"text\",\"text\":\"nuevo mensaje sobre shaders\"}')");
+    db.run("update session set time_updated = 6000 where id = 'ses_1'");
+    db.close();
+
+    const r = await idx.sync(true);
+    expect(r.errors).toEqual([]);
+    expect(r.opencodeTurns).toBe(1);
+    expect(idx.search("shaders")).toContain("opencode:ses_1#4");
     idx.close();
   });
 });

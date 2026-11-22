@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { defaultPaths, type Paths } from "./config.ts";
 import { redact } from "./redact.ts";
@@ -9,7 +9,9 @@ import {
   listOpencodeSessions,
   openOpencode,
   opencodeMessagesAfter,
+  type OpencodeDb,
 } from "./sources/opencode.ts";
+import { localReadable } from "./snapshot.ts";
 
 export type Source = "opencode" | "claude";
 
@@ -99,42 +101,55 @@ export class Index {
   // ---------- opencode ----------
 
   private syncOpencode(report: SyncReport): void {
-    let src;
-    try {
-      src = openOpencode(this.paths.opencodeDb);
-    } catch (e) {
-      report.errors.push(String((e as Error).message));
-      return;
-    }
-    if (!src) return;
-    try {
-      const getSession = this.db.query(
-        "select updated, last_seq from sessions where source = 'opencode' and id = ?",
-      );
-      for (const s of listOpencodeSessions(src)) {
-        const existing = getSession.get(s.id) as { updated: number; last_seq: number } | null;
-        if (existing && existing.updated >= s.updated) continue;
-
-        const { turns, lastSeq } = opencodeMessagesAfter(src, s.id, existing?.last_seq ?? 0);
-        this.upsertSession("opencode", s.id, {
-          title: s.title,
-          cwd: s.cwd,
-          started: s.started,
-          updated: s.updated,
-          lastSeq: Math.max(lastSeq, existing?.last_seq ?? 0),
-        });
-        report.opencodeTurns += this.addTurns("opencode", s.id, turns);
-        report.opencodeSessions += 1;
+    const snapDir = join(this.paths.indexDir, "snapshots");
+    for (const path of this.paths.opencodeDbs) {
+      const local = localReadable(path, snapDir);
+      if (!local || !existsSync(local)) continue;
+      let src;
+      try {
+        src = openOpencode(local);
+      } catch (e) {
+        report.errors.push(`${path}: ${(e as Error).message}`);
+        continue;
       }
-    } finally {
-      src.close();
+      if (!src) continue;
+      try {
+        this.syncOpencodeDb(src, report);
+      } finally {
+        src.db.close();
+      }
+    }
+  }
+
+  private syncOpencodeDb(src: OpencodeDb, report: SyncReport): void {
+    const getSession = this.db.query(
+      "select updated, last_seq from sessions where source = 'opencode' and id = ?",
+    );
+    for (const s of listOpencodeSessions(src)) {
+      const existing = getSession.get(s.id) as { updated: number; last_seq: number } | null;
+      if (existing && existing.updated >= s.updated) continue;
+
+      const { turns, lastSeq } = opencodeMessagesAfter(src, s.id, existing?.last_seq ?? 0);
+      this.upsertSession("opencode", s.id, {
+        title: s.title,
+        cwd: s.cwd,
+        started: s.started,
+        updated: s.updated,
+        lastSeq: Math.max(lastSeq, existing?.last_seq ?? 0),
+      });
+      report.opencodeTurns += this.addTurns("opencode", s.id, turns);
+      report.opencodeSessions += 1;
     }
   }
 
   // ---------- Claude Code ----------
 
   private async syncClaude(report: SyncReport): Promise<void> {
-    const files = await listClaudeFiles(this.paths.claudeDir);
+    const files = [];
+    for (const dir of this.paths.claudeDirs) {
+      if (!existsSync(dir)) continue;
+      files.push(...(await listClaudeFiles(dir)));
+    }
     const getFile = this.db.query("select session_id, offset from files where path = ?");
 
     for (const f of files) {

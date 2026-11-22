@@ -128,7 +128,9 @@ bun run src/cli.ts recent --source opencode --limit 10
 
 ## How it works
 
-- **Sources.** opencode sessions come from `opencode.db`, opened read-only. Claude Code sessions come from `~/.claude/projects/<project-slug>/<session-id>.jsonl`.
+- **Sources.** All opencode databases found on the machine are read: the Windows one (`~/.local/share/opencode/opencode.db`) and one per WSL distro home (`//wsl.localhost/<distro>/home/<user>/.local/share/opencode/opencode.db`). Claude Code sessions come from every `.claude/projects` directory found the same way, as `<project-slug>/<session-id>.jsonl`. WSL distros are discovered with `wsl.exe -l -q`.
+- **opencode layouts.** Both the 1.x layout (`session`, `message`, `part`) and the 2.x layout (`session_v2`, `session_message`) are supported, detected from the tables present.
+- **Databases on WSL.** While opencode runs in WSL, its database cannot be opened in place from Windows (`database is locked`). convbridge keeps a verified copy in `~/.convbridge/snapshots/` and refreshes it at most every 10 minutes, so WSL sessions can be up to about 10 minutes behind.
 - **What is indexed.** User and assistant text. Tool calls are reduced to a line like `[tool: Bash]`. Tool results, reasoning blocks, system, hook and synthetic messages are skipped. Each turn is truncated to about 1500 characters.
 - **Index.** A SQLite database with an FTS5 table (`unicode61`, diacritics removed), stored at `~/.convbridge/index.db`.
 - **Incremental.** opencode sessions are re-read only when their `time_updated` changes. Claude files are read from the last parsed byte offset, and a partial last line waits for the next pass. A Claude file that shrinks is dropped and reparsed.
@@ -142,8 +144,8 @@ All settings are optional environment variables.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CONVBRIDGE_HOME` | `~/.convbridge` | Directory for the index database |
-| `CONVBRIDGE_OPENCODE_DB` | `~/.local/share/opencode/opencode.db` | opencode database path |
-| `CONVBRIDGE_CLAUDE_DIR` | `~/.claude/projects` | Claude Code projects directory |
+| `CONVBRIDGE_OPENCODE_DB` | Windows db plus each WSL distro home | opencode database paths, separated by `;`. Replaces the default list when set. |
+| `CONVBRIDGE_CLAUDE_DIR` | Windows `~/.claude/projects` plus each WSL distro home | Claude Code projects directories, separated by `;`. Replaces the default list when set. |
 
 ## Privacy and security
 
