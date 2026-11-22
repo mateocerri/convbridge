@@ -57,7 +57,7 @@ Relevant line types:
 | `assistant` | yes (text blocks only) | Same block handling as opencode |
 | `ai-title` | used for titles | Generated session title |
 
-Skipped types include `api-request`, `api-request-blob`, `api-request-shape`, `file-history-snapshot`, `file-history-delta`, `attachment`, `mode`, `permission-mode`, `session-owner`, `atis-latch`, `last-prompt`, `cost-state`, and `system`. Each line carries `sessionId`, `timestamp`, `cwd` and `gitBranch`, which are used for filtering.
+Only `user` and `assistant` lines are turns; every other type (API request blobs, file history snapshots, attachments, mode and cost state, system lines) is ignored. Lines flagged `isMeta` are skipped, as are turns whose text starts with `<system-reminder>`, `<command-` or `<local-command-`. Tool use blocks become `[tool: <name>]`; tool results and thinking blocks are dropped. Each line carries `sessionId`, `timestamp` and `cwd`, which are used for filtering.
 
 ## 3. Index
 
@@ -71,8 +71,15 @@ CREATE TABLE sessions (
   cwd        TEXT,
   started    INTEGER,            -- unix ms
   updated    INTEGER,            -- unix ms
-  n_turns    INTEGER,
+  last_seq   INTEGER NOT NULL DEFAULT 0,  -- highest seq indexed so far
   PRIMARY KEY (source, id)
+);
+
+CREATE TABLE files (             -- Claude JSONL read progress
+  path       TEXT PRIMARY KEY,
+  source     TEXT NOT NULL,
+  session_id TEXT,
+  offset     INTEGER NOT NULL DEFAULT 0   -- byte offset past the last parsed line
 );
 
 CREATE TABLE turns (
@@ -86,31 +93,33 @@ CREATE TABLE turns (
 );
 
 CREATE VIRTUAL TABLE turns_fts USING fts5(
-  text,
-  content='turns',
+  text, source UNINDEXED, session_id UNINDEXED,
   tokenize='unicode61 remove_diacritics 2'
-);
+);   -- rowid matches turns.rowid
 ```
 
 Notes:
 
 - `remove_diacritics` lets queries without accents match accented Spanish and other text.
-- Each turn's text is truncated to about 1500 characters at index time. Full text is still available through `get` only if it is kept; otherwise `get` returns the truncated text and says so.
+- Each turn's text is truncated to 1500 characters at index time (after redaction). `get` can only return the truncated text.
 
 ### 3.1 Incremental indexing
 
 - **opencode:** a session is re-read when `session_v2.time_updated` is newer than the stored `updated`. Only messages with `seq` greater than the stored maximum are inserted.
-- **Claude Code:** each JSONL file is tracked by `(size, mtime)` plus the byte offset of the last fully parsed line. Only appended lines are parsed. A partial last line (no trailing newline) is left for the next pass.
+- **Claude Code:** each JSONL file is tracked by the byte offset of the last fully parsed line (`files` table). Only appended bytes are read. A partial last line (no trailing newline) is left for the next pass. If a file becomes smaller than its stored offset, the session is deleted from the index and reparsed from zero.
+- A sync pass that adds no turns does not change a session's `updated`, so snapshot-only writes do not reorder `recent`.
 - **Freshness:** the server reindexes on startup and before a search if the last reindex is older than 30 seconds.
 - Sources are never modified. The opencode database is opened read-only.
 
 ### 3.2 Redaction
 
-Applied to every turn before insertion:
+Applied to every turn before insertion (see `src/redact.ts` for the exact patterns):
 
-- `sk-[A-Za-z0-9_-]{16,}` and similar API key prefixes.
-- `Bearer <token>` headers.
-- `(api[_-]?key|token|secret|password)\s*[:=]\s*\S+`.
+- PEM private key blocks.
+- `sk-` keys, GitHub tokens (`ghp_`, `github_pat_`, ...), AWS access key ids, Slack tokens, Google API keys.
+- JWTs and `Bearer <token>` headers.
+- Credentials embedded in URLs (`scheme://user:pass@host`).
+- `api_key` / `token` / `secret` / `password` assignments with `:` or `=`, including quoted JSON values.
 
 Redaction is pattern-based and best-effort. Users should not rely on it as a security control.
 
@@ -123,21 +132,22 @@ search(query: string, source?: "opencode" | "claude" | "any" = "any",
        cwd?: string, since?: string, limit?: number = 8)
 ```
 
-- Uses FTS5 `bm25()` ranking.
-- Groups hits by session; at most `limit` hits total.
-- Each hit: `ref` (`<source>:<session_id>#<seq>`), date, title, cwd, and a snippet of about 200 characters with matched terms marked.
-- Hard output cap: about 1500 tokens (roughly 6000 characters). Excess hits are dropped and the response says how many were omitted.
+- Query words are extracted (letters and digits) and each is matched as a prefix. All words must appear in the same turn.
+- If that finds nothing and the query has several words, the search retries with any-word matching and says so in the output.
+- Uses FTS5 `bm25()` ranking. At most `limit` hits (1 to 50).
+- Each hit: `ref` (`<source>:<session_id>#<seq>`), date, title, cwd, and a snippet of up to 24 tokens with matched terms in `[brackets]`.
+- Output cap: 6000 characters. Excess hits are dropped and the response says how many were omitted.
 
 ### 4.2 `get`
 
 ```
 get(ref: string, around?: number = 3, max_chars?: number = 4000,
-    after?: number, before?: number)
+    after?: number)
 ```
 
-- Returns turns from the same session in the window `[seq - around, seq + around]`, or a page via `after`/`before` sequence numbers.
-- Output is plain text with role labels, one turn per block.
-- Stops at `max_chars` and returns a cursor for the next page.
+- Returns turns from the same session in the window `[seq - around, seq + around]`, or, with `after`, the next `2 * around + 1` turns after that sequence number.
+- Output is plain text with a header line and one block per turn (`[seq] role date`).
+- Stops at `max_chars`. A turn cut by the cap is marked, and when more turns exist the output ends with `next page: get with after=<seq>`.
 
 ### 4.3 `recent`
 
@@ -149,7 +159,7 @@ recent(source?: "opencode" | "claude" | "any" = "any", cwd?: string, limit?: num
 
 ### 4.4 Errors
 
-Errors are returned as short messages with a stable code, for example `SOURCE_UNAVAILABLE`, `SCHEMA_MISMATCH`, `UNKNOWN_REF`. A schema mismatch in opencode (for example after an upgrade) disables only the opencode source and reports it; Claude results are still returned.
+Tool errors are returned as short plain-text messages (bad ref, unknown session, invalid `since`, search syntax error). Unexpected exceptions come back as `Error: <message>` with `isError` set. A schema mismatch in opencode (for example after an upgrade) skips only the opencode source and is reported by `reindex`; Claude results are still returned.
 
 ## 5. Architecture
 
@@ -158,15 +168,15 @@ convbridge/
   src/
     server.ts             MCP over stdio (JSON-RPC 2.0, no external MCP SDK required)
     cli.ts                same core as CLI: reindex | search | get | recent
-    index.ts              index creation, incremental update, FTS maintenance
-    format.ts             snippets, token budgets, truncation
+    index.ts              index schema, incremental sync, search / get / recent, output budgets
+    config.ts             default paths and CONVBRIDGE_* environment variables
+    text.ts               cleaning, truncation, harness-noise filter
     redact.ts             secret redaction
     sources/
       opencode.ts         read-only reader for opencode.db (checks table shape first)
       claude.ts           JSONL reader with byte-offset tracking
   test/
-    fixtures/             minimal opencode.db and JSONL samples
-    *.test.ts
+    convbridge.test.ts    fixtures are generated in temp directories
   docs/
     DESIGN.md
 ```
@@ -202,7 +212,6 @@ Optional: a one-line instruction in each tool's global agent instructions tellin
 
 ## 8. Open decisions
 
-- License (required before public release).
 - Whether to ship a Claude Code plugin package instead of the `claude mcp add` instruction.
 - Whether to support additional source tools later. The source layer is isolated to make this possible.
 - Schema drift: opencode's table layout may change between versions. The reader validates expected columns at startup and degrades gracefully.

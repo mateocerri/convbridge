@@ -5,6 +5,9 @@
   "type": "module",
   "license": "MIT",
   "private": false,
+  "repository": { "type": "git", "url": "git+https://github.com/mateocerri/convbridge.git" },
+  "homepage": "https://github.com/mateocerri/convbridge#readme",
+  "bugs": { "url": "https://github.com/mateocerri/convbridge/issues" },
   "bin": {
     "convbridge": "src/cli.ts"
   },
