@@ -11,7 +11,10 @@ import {
   opencodeMessagesAfter,
   type OpencodeDb,
 } from "./sources/opencode.ts";
-import { localReadable } from "./snapshot.ts";
+import { isLive, localReadable } from "./snapshot.ts";
+
+/** Wait for another process's write lock on index.db instead of failing with SQLITE_BUSY. */
+const BUSY_MS = 60_000;
 
 export type Source = "opencode" | "claude";
 
@@ -25,6 +28,8 @@ export interface SyncReport {
   claudeFiles: number;
   claudeTurns: number;
   errors: string[];
+  /** Databases another process has open right now; they are read in place, read-only. */
+  warnings: string[];
 }
 
 export interface SearchOptions {
@@ -38,11 +43,13 @@ export class Index {
   readonly db: Database;
   readonly paths: Paths;
   private lastSync = 0;
+  private liveWarned = new Set<string>();
 
   constructor(paths: Paths = defaultPaths(), indexFile = "index.db") {
     this.paths = paths;
     mkdirSync(paths.indexDir, { recursive: true });
     this.db = new Database(join(paths.indexDir, indexFile));
+    this.db.exec(`pragma busy_timeout = ${BUSY_MS}`);
     this.db.exec("pragma journal_mode = wal");
     this.db.exec(`
       create table if not exists sessions (
@@ -81,19 +88,39 @@ export class Index {
     this.db.close();
   }
 
-  /** Incremental sync. Skips work if the last sync was recent, unless `force`. */
-  async sync(force = false): Promise<SyncReport> {
+  private queue: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Incremental sync. Skips work if the last sync was recent, unless `force`. Syncs run one
+   * at a time in this process, and each one is a single write transaction on index.db, so
+   * other convbridge processes wait for the lock instead of interleaving writes.
+   */
+  sync(force = false): Promise<SyncReport> {
+    const run = this.queue.then(() => this.syncOnce(force));
+    this.queue = run.catch(() => {});
+    return run;
+  }
+
+  private async syncOnce(force: boolean): Promise<SyncReport> {
     const report: SyncReport = {
       opencodeSessions: 0,
       opencodeTurns: 0,
       claudeFiles: 0,
       claudeTurns: 0,
       errors: [],
+      warnings: [],
     };
     if (!force && Date.now() - this.lastSync < RESYNC_MS) return report;
 
-    this.syncOpencode(report);
-    await this.syncClaude(report);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.syncOpencode(report);
+      await this.syncClaude(report);
+      this.db.exec("COMMIT");
+    } catch (e) {
+      if (this.db.inTransaction) this.db.exec("ROLLBACK");
+      throw e;
+    }
     this.lastSync = Date.now();
     return report;
   }
@@ -101,9 +128,19 @@ export class Index {
   // ---------- opencode ----------
 
   private syncOpencode(report: SyncReport): void {
-    const snapDir = join(this.paths.indexDir, "snapshots");
     for (const path of this.paths.opencodeDbs) {
-      const local = localReadable(path, snapDir);
+      if (isLive(path)) {
+        const msg = `${path}: en uso por otro proceso (hay -shm/-wal); leído en solo lectura, sin copia`;
+        report.warnings.push(msg);
+        // stderr, not stdout: stdout is the MCP channel. Logged once per path, not on every resync.
+        if (!this.liveWarned.has(path)) {
+          this.liveWarned.add(path);
+          console.error("convbridge:", msg);
+        }
+      } else {
+        this.liveWarned.delete(path);
+      }
+      const local = localReadable(path);
       if (!local || !existsSync(local)) continue;
       let src;
       try {

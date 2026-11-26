@@ -33,6 +33,7 @@ try {
       console.log(
         `opencode: ${r.opencodeSessions} sessions updated, ${r.opencodeTurns} turns added\n` +
           `claude:   ${r.claudeFiles} files scanned, ${r.claudeTurns} turns added` +
+          (r.warnings.length ? `\nwarnings:\n  ${r.warnings.join("\n  ")}` : "") +
           (r.errors.length ? `\nerrors:\n  ${r.errors.join("\n  ")}` : ""),
       );
       break;
